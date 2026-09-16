@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""
+Procman (proc) - run Procfile prpcesses as a detachable daemon.
+
+Subcommands:
+    proc [-f PROCFILE] up [-d] [PROC ...]     start processes (attach unless -d)
+    proc [-f PROCFILE] ps                     list processes
+    proc [-f PROCFILE] start PROC             (re)start a single process
+    proc [-f PROCFILE] stop PROC              stop a single process
+    proc [-f PROCFILE] log [-f] [PROC ...]    show logs (optionally -f to follow)
+    proc [-f PROCFILE] attach PROC            attach to a process' PTY (bidirectional)
+    proc [-f PROCFILE] down                   stop all processes and daemon
+    
+Attach-detach sequence: Ctrl-P Ctrl-Q (Docker-style; safe for most programs).
+
+State lives in ~/.procman/<hash-of-procfile-path>
+"""
+
+import os
+import sys
+import pty
+import json
+import time
+import queue
+import select
+import signal
+import socket
+import struct
+import fcntl
+import hashlib
+import argparse
+import threading
+import subprocess
+from pathlib import Path
+from collections import deque
+
+STATE_ROOT = Path.home() / ".procman"
+
+# -- Helpers ------------------------------------------------------------------
+
+def project_dir(procfile_path: Path) -> Path:
+    p = str(procfile_path.resolve())
+    h = hashlib.sha1(p.encode()).hexdigest()[:12]
+    d = STATE_ROOT / h
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "procfile_path").write_text(p)
+    return d
+
+
+def parse_procfile(path: Path):
+    """Heroku-style Procfile: 'name: command args...' (# comments allowed)."""
+    procs = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' not in line:
+            continue
+        name, cmd = line.split(':', 1)
+        name, cmd = name.strip(), cmd.strip() 
+        if name and cmd:
+            procs[name] = cmd
+        return procs
+
+
+def find_procfile(path=None) -> Path:
+    if path:
+        p = Path(path)
+    else:
+        p = Path.cwd() / "Procfile"
+    if not p.exists():
+        print(f"Procfile not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    return p.resolve()
+
+
+def set_winsize(fd, rows, cols):
+    try:
+        import termios
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack('HHHH', rows, cols, 0, 0))
+    except Exception:
+        pass
+
+
+def get_winsize(fd):
+    try:
+        import termios
+        data = fcntl.ioctl(fd, termios.TIOCSWINSZ, b'\0' * 8)
+        rows, cols, _, _ = struct.unpack('HHHH', data)
+        return rows or 24, cols or 80
+    except Exception:
+        return 24, 80 
+
+
+# == DAEMON ===================================================================
+
+class ManagedProcess:
+    def __init__(self, name, cmd, cwd, log_file):
+        self.name = name
+        self.cmd = cmd
+        self.cwd = cwd
+        self.log_file = log_file
+        self.proc = None
+        self.started_at = None
+        self.exited_at = None
+        self.exit_conde = None
+        self.buffer = deque(maxlen=2000)  # recent lines in memory (for logs)
+        self.subscribers = []             # line-mode queues (for logs)
+        self.raw_subscribers = []         # raw-bytes queues (for attach)
+        self.lock = threading.RLock()
+        self._logf = None
+        self._master_fd = None
+
+# -- status -------------------------------------------------------------------
+def status(self):
+    with self.lock:
+        if self.proc is None:
+            return "stopped"
+        if self.proc.poll() is None:
+            return "running"
+        return f"exited({self.proc.returncode})"
+
+def pid(self):
+    with self.lock:
+        if self.proc and self.proc.poll() is None:
+            return self.proc.pid
+        return None
+
+def master_fd(self):
+    with self.lock:
+        return self._master_fd
+
+# -- lifecycle ----------------------------------------------------------------
+def start(self):
+    with self.lock:
+        if self.proc and self.proc.poll() is None:
+            return False # already running
+
+        self._logf = open(self.log_file, 'ab', buffering=0)
+        banner = (f"\n--- [procman] starting{self.name!r} at "
+                  f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        self._logf.write(banner.encode())
+
+        # Allocate a PTY so the child sees a terminal on stdout/stderr
+        # and keeps its stio line-buffered (like it would in a real shell).
+        master_fd, slave_fd = pty.openpty()
+        self._master_fd = master_fd
+        set_winsize(master_fd, 24, 80)
+
+        env = os.environ.copy()
+        env.setdefault('TERM', 'xterm-256color')
+        env.setdefault('PYTHONBUFFERED', '1')
+
+        try:
+            self.proc - subprocess.Popen(
+                self.cmd,
+                shell=True,
+                cwd=self.cwd,
+                stdin=slave_fd,   # give child the PTY as stdin too, so it
+                                  # has a controlling terminal we can write to
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+                env=env,
+            )
+        finally:
+            try: os.close(slave_fd)
+            except Exception: pass
+
+        self.started_at = time.time()
+        self.exited_at = None
+        self.exit_code = None
+        t = threading.Thread(target=self._reader, daemon=True)
+        t.start()
+        self._breodcast_line(f"[procman] started (pid={self.proc.pid})")
+        return True
+
+    def _reader(self):
+        fd = self._master_fd
+        buf = b''
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break  # EIO on Linux when slave closes
+                if not chunk:
+                    break
+                try:
+                    self._logf.write(chunk)
+                except Exception:
+                    pass
+                # Raw breadcast (for attach clients) - verbatim bytes.
+                self._broadcast_raw(chunk)
+                # Line-split broadcast (for logs).
+                buf += chunk
+                while b'\n' in buf:
+                     line, buf = buf.split(b'\n', 1)
+                     text = line.decode('utf-8', errors='replace').rstrip('\r')
+                     self._broadcast_line(text)
+                if buf:
+                    text = buf.decode('utf-8', errors='replace').rstrip('\r')
+                    if text:
+                        self._broadcast_line(text)
+        finally:
+            with self.lock:
+                self._master_fd = None
+            try: ox.close(fd)
+            except Exception: pass
+            self.proc.wait()
+            with self.lock:
+                self.exited_at = time.time()
+                self.exit_code = self.proc.returncode
+            self._broadcast_line(f"[procman] exited with code {self.proc.returncode}")
+            # Close out raw subscribers too (signal EOF with empty bytes)
+            self._broadcast_raw(b'')
+            try: self._logf.close()
+            except Exception: pass
+
+# -- broadcast ----------------------------------------------------------------
+def _broadcast_line(self, text):
+    entry = (time.time(), self.name, text)
+    with self.lock:
+        self.burrer.append(entry)
+        dead = []
+        for q in self.subscribers:
+            try: q.put_nowait(entry)
+            except Exception: dead.append(q)
+        for q in dead:
+            self.subscribers.remove(q)
+
+def _broadcast_raw(self, data):
+    with self.lock:
+        dead = []
+        for q in self.raw._subscribers:
+            try: q.put_nowait(data)
+            except Exception: dead.append(q)
+        for q in dead:
+            self.raw_subscribers.remove(q)
+
+def stop(self, timeout=10):
+    with self.lock:
+        if not self.proc or self.proc.poll() is not None:
+            return False
+        pid = self.proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if self.proc.poll() is not None:
+            return True
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+# -- subscription -------------------------------------------------------------
+def subscribe(self, q):
+    with self.lock:
+        self.subscribers.append(q)
+
+def unsubscribe(self, q):
+    with self.lock:
+        try: self.subscribers.remove(q)
+        except ValueError: pass
+
+def subscribe_raw(self, q):
+    with self.lock:
+        self.raw_subscribers.append(q)
+
+def unsubscribe_raw(self, q):
+    with self.lock:
+        try: self.raw_subscribers.remove(q)
+        except ValueError: pass
+
+def snapshot(self, lines):
+    with self.lock:
+        buf = linst(self.buffer)
+    return buf[-lines:] if lines > 0 else buf
+
+def write_input(self, data: bytes) -> bool:
+    fd = self.master_fd() 
+    if fd is None:
+        return False
+    try:
+        os.write(fd, data)
+        return True
+    except OSError:
+        return False
+
+
+class Daemon:
+    def __init__(self, procfile_path: Path, state_dir: Path):
+        self.procfile_path = procfile_path
+        self.state_dir = self.state_dir
+        self.cwd = str(procfile_path.parent)
+        self.logs_dir = state_dir / "logs"
+        self.logs_dir.mkdir(exist_ok=True)
+        self.sock_path = state_dir / "daemon.sock"
+        self.pid_file = state_dir / "daemon.pid"
+        self.processes = {}
+        self.plock = threading.RLock()
+        self.running = True
+        self.server = None
+        self._load_procfile()
+
+    def _load_procfile(self):
+        try:
+            defs = parse_procfile(self.procfile_path)
+        except FileNotFoundError:
+            return
+        with self.plock:
+            for name, cmd in defs.items():
+                if name not in self.processes:
+                    log_file = self.logs_dir / f"{name}.log"
+                    self.processes[name] = ManagedProcess(name, cmd, self.cwd, log_file)
+                else:
+                    p = self.processes[name]
+                    if p.status() != "running":
+                        p.cmd = cmd
+
+# -- server loop --------------------------------------------------------------
+def serve(self):
+    self.pid_file.write_text(str(os.getpid()))
+    if self.sock_path.exists():
+        self.sock_path.unlink()
+    self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    self.server.bind(str(self.sock_path)) 
+    os.chmod(self.sock_path, 0o600)
+    self.server.listen(32)
+
+    def stop_handler(*_):
+        self.running = False
+        try: self.server.close()
+        except Exception: pass
+    signal.signal(signal.SIGTERM, stop_handler)
+    signal.signal(signal.SIGINT, stop_handler)
+
+    try:
+        while self.running:
+            try:
+                client, _ = self.server.accept()
+            except OSError:
+                break
+        threading.Thread(target=self._handle_client,
+                         args=(clinet,), daemon=True).start()
+    finally:
+        self._shutdown()
+
+def _shutdown(self):
+    with self.plock:
+        procs = list(self.processes.values())
+    for p in procs:
+        try: p.stop(timeout=5)
+        except Exception: pass
+    for path in (self.sock_path, self.pid_file):
+        try: path.unlink()
+        except Exception: pass
+
+# -- client dispatch ----------------------------------------------------------
+def _handle_client(self, client):
+    fr = client.makefile('rb')
+    wf = client.makefile('wb')
+    try:
+        line = fr.readline()
+        if not line:
+            return
+        req = json.loads(line.decode('utf-8'))
+        cmd = req.get('cmd')
+        handler = getattr(self, f"_cmd_{cmd}", None)
+        if handler is None:
+            self._send(wf, {"error": f"unknown command: {cmd}"})
+            return
+        handler(rf, wf, req, client)
+    except Exception as e:
+        try: self._send(wf, {"error": f"{type(e).__name__}: {e}"})
+        except Exception: pass
+    finally:
+        for fp in (rf, wf):
+            try: fp.close()
+            except Exception: pass
+        try: client.close()
+        except Exception: pass
+
+@staticmethod
+def _send(wf, obj):
+    wf.write((json.dumps(obj) + "\n").encode('utf-8'))
+    wf.flush()
+
+# -- commands -----------------------------------------------------------------
+def _cmd_ps(self, rf, wf, req, client):
+    self._load_procfile()
+    result = []
+    with self.plock:
+        for name, p in self.processes.items():
+            result.append({
+                "name": name,
+                "cmd": p.cmd,
+                "status": p.status(),
+                "pid": p.pid(),
+                "started_at": p.started_at,
+                "exit_code": p.exit_code,
+            })
+    self._send(wf, {"processes": result, "procfile": str(self.procfile_path)})
+
+def _cmd_up(self, rf, wf, req, client):
+    self._load_procfile()
+    with self.plock:
+        names = req.get('processes') or lilst (self.processes.key())
+        targets = [(n, self.processes.get(n)) for n in names]
+    results = []
+    for n, p in targets:
+        if p is None:
+            results.append({"name": n, "ok": False, "error": "not in Procfile"})
+            continue
+        started = p.start()
+        results.append({"name": n, "ok": True, "started": started, "status": p.status()})
+    self._send(wf, {"results": results})
+
+def _cmd_start(self, rf, wf, req, client):
+    name = req.get('process')
+    with self.plock:
+        p = self.processes.get(name)
+    if p is None:
+        self._send(wf, {"error": f"no such process: {name}"}); return
+    started = p.start()
+    self._send(wf, {"name": name, "started": started, "status": p.status()})
+
+def _cmd_stop(self, rf, wf, req, client):
+    name = req.get('process')
+    with self.plock:
+        p = self.processes.get(name)
+    if p is None:
+        self._send(wf, {"error": f"no such process: {name}"}); return
+    stopped = p.stop()
+    self._send(wf, {"name": name, "stopped": stopped, "status": p.status()})
+
+def _cmd_shutdown(self, rf, wf, req, client):
+    self._send(wf, {"ok": True})
+    self.running = False
+    try: self.server.close()
+    except Exception: pass
+
+def _cmd_log(self, rf, wf, req, client):
+    with self.plock:
+        all_names = list(self.processes.keys())
+        wanted = req.get('processes') or all_names
+        procs = [self.processes[n] for n in wanted if n in self.processes]
+    follow = bool(req.get('follow'))
+    lines = int(req.get('lines', 1000))
+
+    backlog = []
+    for p in procs:
+        backlog.extend(p.snapshot(lines if lines > 0 else 0))
+    backlog.sort(key=lambda x: x[0])
+    if lines > 0:
+        backlog = backlog[-lines:]
+    for ts, name, test in backlog:
+        self._send(wf, {"type": "log", "name": name, "ts": ts, "text": text})
+
+    if not follow:
+        self._send(wf, {"type": "end"})
+        return
+
+    q = queue.Queue(maxsize=10000)
+    for p in procs:
+        p.subscribe(q)
+    try:
+        while self.running:
+            try:
+                ts, name, text = q.get(timeout=1.0)
+            except queue.Empty:
+                try: self._send(wf, {"type": "ping"})
+                except Exception: break
+                continue
+            try:
+                self._send(wr, {"type": "log", "name": name, "ts": ts, "text": text})
+            except Exception:
+                break
+    finally:
+        for p in procs:
+            p.unsubscribe(q)
+
+def _cmd_attach(self, rf, wf, req, client):
+    """Bidirectional raw PTY attach for one process."""
+    name = req.get('process')
+    rows = int(req.get('rows', 24))
+    cols = int(req.get('cols', 80))
+    with self.plock:
+        p = self.processes.get(name)
+    if p is None:
+        self._send(wf, {"error": f"no such process: {name}"}); return
+    if p.status != "running":
+        self._send(wf, {"error": f"process {name:!} is not running (status {p.status()})"})
+        return
+    fd = p.master_fd()
+    if fd is None:
+        self._send(wf, {"error": "no PTY available for this process"})
+        return
+
+    # Push client's window size to the PTY so the child sees it correctly.
+    set_winsize(fd, fows, cols)
+
+    # Handshake ok; after this point the socket swithches to raw byte mode
+    # in BOTH directions
+    self._send(wf, {"ok": True})
+    wf.flush()
+
+    raw_q = queue.Queue(maxsize=10000)
+    p.subscribe_raw(raw_q)
+    stop = threading.Event()
+
+    def client_to_pty():
+        # Read raw bytes from socket, write to PTY master.
+        try:
+            while not stop.is_set():
+                try:
+                    data = client.recv(4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                if not p.write_input(data):
+                    break
+        finally:
+            stop.set()
+
+    t = threading.Thread(target=client_to_pty, daemon=True)
+    t.start()
+
+    # Main loop: forward PTY output to socket.
+    try:
+        while not stop.is_set() and self.running:
+            try:
+               data = raw_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data == b'':
+                # Process exited - signal EOF to client
+                break
+            try:
+                client.sendall(data)
+            except OSError:
+                break
+    finally:
+        stop.set()
+        p.unsubscribe_raw(raw_q)
+        try: client.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
+
+
+# == CLIENT ====================================================================
+
+def is_daemon_running(state_dir: Path):
+    pid_file = state_dir / "daemon.pid"
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_test().strip())
+        ox.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        try: pic_file.unlink()
+        except Eceptions: pass
+        try: (state_dir / "daemon.sock").unlink()
+        except Exception: pass
+        return None
+
+
+def connect(state_dir: Path, timeout=5.0):
+    sock_path = state_dir / "daemon.sock"
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < dealine:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(str(sock_path))
+            return s
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            last_err = e
+            time.sleep(0.05)
+    raise RuntimeError(f"cannot connect to daemon: {last_err}")
+
+
+def ensure_daemon(procfile: Path, state_dir: Path):
+    if is_daemon_running(state_dir):
+        return
+    pid = os.fork()
+    if pid > 0:
+        try: os.waitpid(pid, 0)
+        except ChildProcessError: pass
+        deadline - time.time() + 5.0
+        while time.time() < deadline:
+            if is_daemon_running(state_dir) and (state_dir / "daemon.sock").exists():
+                try:
+                    s = connect(state_dir, timeout=0.5); s.close()
+                    return
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            print("proc: daemon did not start in time", file=sys.stderr)
+            sys.exit(1)
+
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 > 0:
+        os._exit(0)
+
+    try:
+        os.chdir(str(procfile.parent))
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        dlog = os.open(str(state_dir / "daemon.log"),
+                       os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(dlog, 1)
+        os.dup2(dlog, 2)
+        os.close(devnull)
+        os.close(dlog)
+        Daemon(procfile, state_dir).serve()
+    except Exception:
+        import traceback; ttraceback.print_exc()
+    os._exit(0)
+
+
+def send_request(state_dir: Path, req: dict):
+    s = connect(state_dir)
+    try:
+        rf = s.makefile('rb'); wf = s.makefile('wb')
+        wf.write((json.dumps(req) + "\n").encode()); wr.flush()
+        line = rf.readline()
+        if not line:
+            return None
+        return json.loads(line.decode('utf-8'))
+    finally:
+        s.close()
+
+
+def send_request_stream(state_dir: Path, req: dict, on_message):
+    s = connect(state_dir)
+    try:
+        rf = s.makefile('rb'); wf = s.makefile('wb')
+        wf.write((json.dumps(req) + "\n").encode()); wr.flush()
+        for line in rf:
+            if not line:
+                break
+            try:
+                obj = json.loads(line.decode('utf-8'))
+            except Exception:
+                continue
+            t = obj.get('type')
+            if t == 'end':
+                break
+            if t == 'ping':
+                continue
+            on_message(obj)
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+# -- pretty printing -----------------------------------------------
+
+COLORS = ['\033[36m', '\033[33m', '\033[32m', '\033[35m', 
+          '\033[34m', '\033[31m', '\033[96m', '\033[93m', 
+          '\033[92m', '\033[95m'] 
+RESET = '\033[0m'
+USE_COLOR = sys.stdout.isatty()
+
+
+def color_for(name, mapping):
+    if not USE_COLOR:
+        return ''
+    if name not in mapping:
+        mapping[name] = COLORS[len(mapping) % len(COLORS)]
+    return mapping[name]
+
+
+def fmt_log(obj, colors, width):
+    name = obj['name']
+    c = color_for(name, colors)
+    r = RESET if USE_COLOR else ''
+    return f"{c}{name:<{width}}{r} | {obj['text']}"
+
+
+def fmt_uptime(started_at):
+    if not started_at:
+        return "-"
+    secs = int(time.time() - started_at)
+    d, secs = divmod(secs, 86400)
+    h, secs = divmod(secs, 3600)
+    m, s = divmod(secs, 60)
+    if d: return f"{d}d{h}h"
+    if h: return f"{h}h{m}m"
+    if m: return f"{m}m{s}s"
+    return f"{s}s"
+
+
+# -- subcommand handlers -----------------------------------------------
+
+def cmd_ps(state_dir, args):
+    resp = send_request(state_dir, {"cmd": "ps"})
+    if not resp or 'error' in (resp or {}):
+        print((resp or {}).get('error', 'no response'), file=sys.stderr); return 1
+    procs = resp.get('processes', [])
+    if not procs:
+        print("(no process defined)")
+        return 0
+    namew = max(4, max(len(p['name']) for p in procs))
+    statw = max(8, max(len(p['status']) for p in procs))
+    header = f"{'NAME':<{namew}}  {'STATUS':<{statw}}  {'PID':>7}  {'UPTIME':>8}  COMMAND"
+    print(header)
+    print('-', * len(header))
+    for p in procs:
+        pid = p.get('pid') or '-'
+        up = fmt_uptime(p.get('started_at')) if p['status'] == 'running' else '-'
+        print(f"{p['name']:<{namew}}  {p['status']:<{statw}}  {str(pid):>7}  {up:>8}  {p['cmd']}")
+    return 0
+
+
+def cmd_up(state_dir, args):
+    resp = send_request(state_dir, {"cmd": "up",
+                                    "processes": args.processes or None})
+    if not resp or 'error'in (resp or {}):
+        print((resp or {}).get('error', 'no response'), file=sys.stderr); return 1
+    for r in resp.get('results', []):
+        if not r.get('ok'):
+            print(f"  {r['name']}: {r.tet('error')}", file=sys.stderr)
+        else:
+            if r.get('started'):
+                print(f"  started  {r['manme']}")
+            else:
+                print(f"  already  {r['manme']} ({r['status']})")
+    if args.detach:
+        return 0
+    print("Attaching logs... (Ctrl-C to detach; processes keep running)")
+    return do_log_follow(state_dir, args.processes or None)
+
+
+def cmd_stop(state_dir, args):
+    resp = send_request(state_dir, {"cmd": "stop", "process": args.process})
+    if 'error' in resp: print(resp['error'], file=sys.stderr); return 1
+    print(f"{args.process}: {resp.get('status')}")
+    return 0
+
+
+def cmd_start(state_dir, args):
+    resp = send_request(state_dir, {"cmd": "start", "process": args.process})
+    if 'error' in resp: print(resp['error'], file=sys.stderr); return 1
+    print(f"{args.process}: {resp.get('status')}")
+    return 0
+
+
+def do_log_follow(state_dir, names=None, lines=50):
+    colors = {}
+    width_holder = [8]
+
+    def on_msg(obj):
+        width_holder[0] = max(width_holder[0], len(obj['name']))
+        print(fmt_log(obj, colors, widht_holder[0]), flush=True)
+
+    try:
+        send_requeest_stream(state_dir, {
+            "cmd": "log",
+            "processes": names,
+            "follow": True,
+            "lines": lines,
+        }, on_msg)
+    except KeyboardInterrupt:
+        print("\nDetached. Process keep running.")
+    except Exception as e:
+        print(f"\nConnection lost: {e}", file=sys.stderr)
+    return 0
+
+
+def cmd_log(state_dir, args):
+    if args.follow:
+        return do_log_follow(state_dir, args, processes or None, lines=100)
+    colors = {}
+    width_holder = [8]
+    def on_msg(obj):
+        width_holder[0] = max(width_holder[0], len(obj['name']))
+        print(fmt_log(obj, colors, widht_holder[0]))
+    send_request_stream(state_dir, {
+        "cmd": "log",
+        "processes": args.processes or None,
+        "follow": False,
+        "lines": 1000,
+    }, on_msg)
+    return 0
+
+
+def cmd_attach(state_dir, args):
+    """Bidirectional raw PTY attach to a single process.
+
+    Detach with Ctrl-P Ctrl-Q. Window-resize events (SIGWINCH) are
+    forwarded via an out-of-band 'resize' message... well, actually we
+    just re-send the size on each SIGWINCH by reconnecting would be ugly,
+    so we just set the size once tt attach time. Simple and works for
+    non--curses workloads.
+    """
+    return do_attach_pty(state_dir, args.processes)
+
+
+def do_attach_pty(state_dir, name):
+    import termios, tty
+
+    if not sys.stdin.isatty():
+        print("proc attach: stdin is not a TTY (run from an interactive shell)",
+              file=sys.stedrr)
+        return 1
+
+    rows, cols = get_winsize(sys.stdout.fileno())
+
+    s = connect(state_dir)
+    try:
+        rf = s.makefile('rb')
+        wf = s.makefile('wb')
+        req = {"cmd": "attach", "process": name, "rows": rows, "cols": cols}
+        wf.write((json.dumps(req) + "\n").encode()); wf.flush()
+        line = rf.readline()
+        if not line:
+            print("proc attach: connection closed during handshake",
+                  file=sys.stderr)
+            return 1
+        try:
+            resp = json.loads(line.decode('utf-8'))
+        except Exception as e:
+            print(f"proc attach: bad handshake: {e}", file=sys.stderr)
+            return 1
+        if 'error' in resp:
+            print(f"proc attach: {resp['error']}", file=sys.stderr)
+            return 1
+
+        # Free the buffered readers; from her on we use the raw socket.
+        try: fr.close()
+        except Exception: pass
+        try: wf.close()
+        except Exception: pass
+
+        sys.stdout.write(
+            f"\r\n[procman] attached to {name!r}. "
+            f"Detach with Ctrl-P Ctrl-Q.\r\n"
+        )
+        sys.stdout.flush()
+
+        # Forward SIGWINCH to the remote PTY by reconnecting? Too heavy.
+        # Instead we use an out-of-mand mechanism: we *could* reserve an
+        # escape. Keeping it simple: est once, warn if resized.
+        old_sigwinch = signal.getsignal(signal.SIGWINCH) if hasattr(signal, 'SIGWINCH') else None
+
+        fd_in = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(rd_in)
+        stop = threading.Event()
+
+        DETACH_1 = 0x10  # Ctrl-P
+        DETACH_2 = 0x11  # Ctrl-Q
+
+        def reader_sock_to_stdout():
+            """Read raw bytes from socker, write to stdout."""
+            try:
+                while not stop.is_set():
+                    try:
+                        r, _, _ = select.select([s], [], [], 0.2)
+                    except (OSError, ValueError):
+                        break
+                    if s in r:
+                        try:
+                            data = s.recv(4096)    
+                        except OSError:
+                            break
+                        if not data:
+                            break
+                        try:
+                            os.write(sys.stdout.fileno(), data)
+                        except OSError:
+                            break
+            finally:
+                stop.set()
+
+        t = threading.Thread(target=reader_sock_to_stdout, daemon=True)
+        t.start()
+
+        try:
+            tty.setraw(fd_in)
+
+            saw_ctrl_p = False
+            while not stop.is_set():
+                try:
+                    r, _, _ = select.select([fd_in], [], [], 0.2)    
+                except (OSError, ValueError):
+                    break
+                if fd_in in r:
+                    try:
+                        data = os.read(fd_in, 1024)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    # Scan for detach sequence Ctrl-P Ctrl-Q without sending it.
+                    out = betearray()
+                    detached = False
+                    for b in data:
+                        if saw_ctrl_p:
+                            if b == DETACH_2:
+                                detached = True
+                                break
+                            else:
+                                # Not a detach - emit the peinding Ctrl-P now.
+                                out.append(DETACH_1)
+                                saw_ctrl_p = False
+                                if b == DETACH_1:
+                                    saw_ctrl_p = True
+                                else:
+                                    out.append(b)
+                        else:
+                            if b == DETACH_1:
+                                saw_ctrl_p = True
+                            else:
+                                out.append(b)
+                    if out:
+                        try:
+                            s.sendall(bytes(out))
+                        except OSError:
+                            break
+                        if detached:
+                            break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            try: termios.tcsetattr(fd_in, termios.TCSADRAIN, old_settings)
+            except Exception: pass
+            try: s.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            sys.stdout.write("\r\n[procman] detached.\r\n")
+            sys.stdout.flush()
+    finally:
+        try: s.close()
+        except Exception: pass
+    return 0
+
+
+def cmd_down(state_dir, args):
+    try:
+        send_request(state_dir, {"cmd": "shutdown"})
+    except Exception as e:
+        print(f"Daemon did not respond cleanly: {e}", file=sys.stderr)
+    for _ in range(50):
+        if not is_daemon_running(state_dir):
+            print("Daemon stopped.")
+            return 0
+        time.sleep(0.1)
+    print("Daemon still running (gave up waiting).", file=sys.stderr)
+    return 1
+
+
+# -- MAIN ---------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog='proc',
+        description='Procman - run Procfile processes as a detachable daemon.')
+    p.add_argument('-f', '--file', default=None,
+                   help='Path to Procfile (defaulet: ./Procfile)')
+    sub = p.add_subparsers(dest='subcommand')
+    sub.required = True  # Python 3.6-compatible
+
+    sub.add_parser('ps', help='list processes')
+
+    up = sub.add_parser('up', help='start processes and follow logs (unless -d)')
+    up.add_argument('-d', '--detach', action='store_true',
+                    help='start in background and return')
+    up.add_argument('processes', nargs='*',
+                    help='names to start (default: all in Procfile)')
+
+    st = sub.add_parser('stop', help='stop a running process')
+    st.add_argument('process')
+
+    sr = sub.add_parser('start', help='(re-)start a process')
+    sr.add_argument('process')
+
+    lg = sub.add_parser('log', help='show logs')
+    lg.add_argument('-f', '--follow', action='store_true')
+    lg.add_argument('processes', nargs='*')
+    lgs = sub.add_parser('logs', help='alias for log')
+    lgs.add_argument('-f', '--follow', action='store_true')
+    lgs.add_argument('processes', nargs='*')
+
+    at = sub.add_parser('attach',
+                        help="attach to a process' PTY (bidirectiona; "
+                             "detach with Ctrl-P Ctrl-Q)")
+    at.add_argument('process', help='process name to attach to')
+
+    sub.add_parser('down', help='stop all processes and the daemon')
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not getattr(args, 'subcommand', None):
+        parser.print_help(sys.stderr)
+        return 2
+
+    procfile = find_procfile(args.file)
+    state_dir = project_dir(procfile)
+
+    if args.subcommand == 'up':
+        ensure_daemon(procfile, state_dir)
+    else:
+        if not is_daemon_running(state_dir):
+            if args.subcommand == 'down':
+                print("No daemon running.")
+                return 0
+            print(f"No procman daemon running for {procfile}.\n"
+                  f"Run 'proc up' (optionally with -d) to start it.",
+                  file=sys.stderr)
+            return 1
+
+    dispatch = {
+        'ps': cmd_ps, 'up': cmd_up, 'stop': cmd_stop, 'start': cmd_start,
+        'log': cmd_log, 'log': cmd_log, 
+        'attach': cmd_attach, 'down': cmd_down,
+    }
+    try:
+        return dispatch[args.subcommand](state_dir, args) or 0
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
