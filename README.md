@@ -2,6 +2,22 @@
 
 Note: there is already a repo at https://github.com/sarnold/procman/ — our Procman is a completely different project with no affiliation. If we need to rename ours, we can; but for now this name works. If you don't like it, don't use it.
 
+## Installation
+
+Recommended:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/luke10x/procman/main/install.sh)"
+```
+
+Alternatively, clone and run `./install.sh`:
+
+```bash
+git clone https://github.com/luke10x/procman && cd procman && ./install.sh
+```
+
+Then add the install location to your PATH (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
+
 Procman is a lightweight Procfile process manager for running, logging, and controlling local development services through a detachable daemon.
 
 ## Features
@@ -21,6 +37,22 @@ Procman is a lightweight Procfile process manager for running, logging, and cont
 Procman is a PTY-aware process supervisor for Procfiles: like [Foreman](https://github.com/ddollar/foreman) / [Honcho](https://github.com/DHH/honcho) in CLI usage, but it allocates pseudo-terminals per process (so you can detach them with Ctrl‑P/Ctrl‑Q), runs them as a daemon, and includes a no-TTY mode that behaves like the plain Foreman/Honcho.
 
 CLI usage mirrors Docker Compose; think of Procman as a Docker Compose that runs processes instead of containers.
+
+## Installation
+
+Recommended:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/luke10x/procman/main/install.py)"
+```
+
+Alternatively, clone and run `python3 install.py`:
+
+```bash
+git clone https://github.com/luke10x/procman && cd procman && python3 install.py
+```
+
+Then add the install location to your PATH (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
 
 ## Requirements
 
