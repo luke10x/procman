@@ -46,6 +46,8 @@ from pathlib import Path
 
 STATE_ROOT = Path(os.environ.get("PROCMAN_STATE_ROOT", Path.home() / ".procman"))
 
+VERSION = "0.0.1"
+
 
 # -- Helpers ------------------------------------------------------------------
 
@@ -1063,8 +1065,12 @@ def build_parser():
         description="Procman - run Procfile processes as a detachable daemon.",
     )
     parser.add_argument("-f", "--file", default=None, help="Path to Procfile (default: ./Procfile)")
+    parser.add_argument("-v", "--version", action="store_true")
     sub = parser.add_subparsers(dest="subcommand")
     sub.required = True
+
+    # Allow version flag without a subcommand
+    sub.required = False
 
     sub.add_parser("ps", help="list processes")
 
@@ -1104,6 +1110,9 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.version:
+        print(VERSION)
+        return 0
     procfile = find_procfile(args.file)
     state_dir = project_dir(procfile)
 
