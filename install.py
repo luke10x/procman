@@ -83,7 +83,7 @@ def get_install_target():
     if primary is None:
         for p in parts:
             if os.path.isdir(p) and os.access(p, os.W_OK):
-                primary = p + "/procman"
+                primary = p + "/proc"
                 break
 
     return primary
@@ -113,8 +113,12 @@ def main():
                 print_info("Already up to date.")
             else:
                 print_info("Newer version detected — reinstalling...")
-                shutil.copy(os.path.join(tmp_dir, "proc"), target + "/proc")
-                os.chmod(target + "/proc", 0o755)
+                src = os.path.join(tmp_dir, "proc")
+                dst = target + "/proc"
+                if not shutil.copy(src, dst):
+                    raise RuntimeError(f"Failed to copy {src} to {dst}")
+                os.chmod(dst, 0o755)
+                print_info(f"Installed to: {dst}")
 
         except Exception as e:
             print_error(f"Installation failed: {e}")
