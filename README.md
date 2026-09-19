@@ -15,7 +15,7 @@ Procman is a lightweight Procfile process manager for running, logging, and cont
 
 Procman is a PTY-aware process supervisor for Procfiles: like Foreman/Honcho in CLI usage, but it allocates pseudo-terminals per process (so you can detach them with Ctrl‑P/Ctrl‑Q), runs them as a daemon, and includes a no-TTY mode that behaves like the plain Foreman/Honcho.
 
-CLI usage mirrors Docker Compose; this project is inspired by Docker Compose but fitted to run processes without Docker.
+CLI usage mirrors Docker Compose; think of Procman as a Docker Compose that runs processes instead of containers.
 
 ## Requirements
 
