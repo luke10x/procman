@@ -3,15 +3,25 @@
 Procman (proc) - run Procfile processes as a detachable daemon.
 
 Subcommands:
-    proc [-f PROCFILE] up [-d] [PROC ...]     start processes (attach unless -d)
-    proc [-f PROCFILE] ps                     list processes
-    proc [-f PROCFILE] start PROC             (re)start a single process
-    proc [-f PROCFILE] stop PROC              stop a single process
-    proc [-f PROCFILE] log [-f] [PROC ...]    show logs (optionally -f to follow)
-    proc [-f PROCFILE] attach PROC            attach to a process' PTY (bidirectional)
-    proc [-f PROCFILE] down                   stop all processes and daemon
+    proc [-f PROCFILE] up [-d] [-T] [PROC ...]  start processes (attach unless -d)
+    proc [-f PROCFILE] ps                       list processes
+    proc [-f PROCFILE] start [-T] PROC          (re)start a single process
+    proc [-f PROCFILE] stop PROC                stop a single process
+    proc [-f PROCFILE] log [-f] [PROC ...]      show logs (optionally -f to follow)
+    proc [-f PROCFILE] attach PROC              attach to a process' PTY (bidirectional)
+    proc [-f PROCFILE] down                     stop all processes and daemon
+
+TTY allocation:
+    By default each process gets a pseudo-tty (PTY), so it behaves as if run in
+    an interactive shell (line-buffered output, color, 'attach' works).
+    Pass -T / --no-TTY to disable PTY allocation: the process
+    runs on plain pipes with stdin closed. This gives cleaner logs (no ANSI
+    escape codes) and avoids stdin hangs, but 'attach' is unavailable and
+    output may be block-buffered by the child (set PYTHONUNBUFFERED / use
+    stdbuf -oL for line-buffered logs).
 
 Attach-detach sequence: Ctrl-P Ctrl-Q (Docker-style; safe for most programs).
+Note: TTY mode is per-start - 'proc start PROC' without -T restarts in PTY mode.
 
 State lives in ~/.procman/<hash-of-procfile-path>.
 """
@@ -106,6 +116,7 @@ class ManagedProcess:
         self.lock = threading.RLock()
         self._logf = None
         self._master_fd = None
+        self.use_pty = True
 
     def status(self):
         with self.lock:
@@ -125,11 +136,12 @@ class ManagedProcess:
         with self.lock:
             return self._master_fd
 
-    def start(self):
+    def start(self, use_pty=True):
         with self.lock:
             if self.proc and self.proc.poll() is None:
-                return False
+                return False # Already running
 
+            self.use_pty = use_pty
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self._logf = open(self.log_file, "ab", buffering=0)
             banner = (
@@ -138,31 +150,51 @@ class ManagedProcess:
             )
             self._logf.write(banner.encode())
 
-            master_fd, slave_fd = pty.openpty()
-            self._master_fd = master_fd
-            set_winsize(master_fd, 24, 80)
+            # master_fd, slave_fd = pty.openpty()
+            # self._master_fd = master_fd
+            # set_winsize(master_fd, 24, 80)
 
             env = os.environ.copy()
-            env.setdefault("TERM", "xterm-256color")
+            # env.setdefault("TERM", "xterm-256color")
             env.setdefault("PYTHONUNBUFFERED", "1")
+
+            if use_pty:
+                # Allocate a PTY so the child sees a terminal on stdout/stderr
+                # and keeps its stdio line-buffered (like in a real shell).
+                master_fd, slave_fd = pty.openpty()
+                self._master_fd = master_fd
+                set_winsize(master_fd, 24, 80)
+                env.setdefault('TERM', 'xterm-256color')
+                stdin_t = stdout_t = stderr = slave_fd
+            else:
+                # -T / --no-TTY: plain pipes, no PTY
+                self._master_fd = None
+                slave_fd
+                stdin_t = subprocess.DEVNULL
+                stdout_t = subprocess.PIPE
+                stderr_t = subprocess.STDOUT
 
             try:
                 self.proc = subprocess.Popen(
                     self.cmd,
                     shell=True,
                     cwd=self.cwd,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
+                    # stdin=slave_fd,
+                    # stdout=slave_fd,
+                    # stderr=slave_fd,
+                    stdin=stdin_t,
+                    stdout=stdout_t,
+                    stderr=stderr_t,
                     start_new_session=True,
                     close_fds=True,
                     env=env,
                 )
             finally:
-                try:
-                    os.close(slave_fd)
-                except Exception:
-                    pass
+                # try: os.close(slave_fd)
+                # except Exception: pass
+                if slave_fd is not None:
+                    try: os.close(slave_fd)
+                    except Exception: pass
 
             self.started_at = time.time()
             self.exited_at = None
@@ -172,7 +204,13 @@ class ManagedProcess:
             return True
 
     def _reader(self):
-        fd = self._master_fd
+        # fd = self._master_fd
+        if self.use_pty:
+            fd = self._master_fd
+            pipe_obj = None
+        else:
+            pipe_obj = self.proc.stdout
+            fd = pipe_obj.fileno()
         buf = b""
         try:
             while True:
@@ -199,10 +237,14 @@ class ManagedProcess:
         finally:
             with self.lock:
                 self._master_fd = None
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+            # try: os.close(fd)
+            # except Exception: pass
+            if pipe_obj is not None:
+                try: pipe_obj.close()
+                except Exception: pass
+            else:
+                try: os.close(fd)
+                except Exception: pass
             try:
                 self.proc.wait()
             except Exception:
@@ -423,11 +465,13 @@ class Daemon:
                     "pid": process.pid(),
                     "started_at": process.started_at,
                     "exit_code": process.exit_code,
+                    "tty": process.use_pty,
                 })
         self._send(wf, {"processes": result, "procfile": str(self.procfile_path)})
 
     def _cmd_up(self, rf, wf, req, client):
         self._load_procfile()
+        use_pty = bool(req.get('tty', True))
         with self.plock:
             names = req.get("processes") or list(self.processes.keys())
             targets = [(name, self.processes.get(name)) for name in names]
@@ -436,7 +480,7 @@ class Daemon:
             if process is None:
                 results.append({"name": name, "ok": False, "error": "not in Procfile"})
                 continue
-            started = process.start()
+            started = process.start(use_pty=use_pty)
             results.append({
                 "name": name,
                 "ok": True,
@@ -452,7 +496,7 @@ class Daemon:
         if process is None:
             self._send(wf, {"error": f"no such process: {name}"})
             return
-        started = process.start()
+        started = process.start(use_pty=bool(req.get('tty', True)))
         self._send(wf, {"name": name, "started": started, "status": process.status()})
 
     def _cmd_stop(self, rf, wf, req, client):
@@ -529,7 +573,9 @@ class Daemon:
             return
         fd = process.master_fd()
         if fd is None:
-            self._send(wf, {"error": "no PTY available for this process"})
+            # self._send(wf, {"error": "no PTY available for this process"})
+            self._send(wf, {"error": "no PTY for this process "
+                                     "(started with -T/--no-TTY?)"})
             return
 
         set_winsize(fd, rows, cols)
@@ -760,15 +806,17 @@ def cmd_ps(state_dir, args):
         return 0
     namew = max(4, max(len(process["name"]) for process in procs))
     statw = max(8, max(len(process["status"]) for process in procs))
-    header = f"{'NAME':<{namew}}  {'STATUS':<{statw}}  {'PID':>7}  {'UPTIME':>8}  COMMAND"
+    header = (f"{'NAME':<{namew}}  {'STATUS':<{statw}}  {'PID':>7}  "
+              f"{'UPTIME':>8}  {'TTY':<3}  COMMAND")
     print(header)
     print("-" * len(header))
     for process in procs:
         pid = process.get("pid") or "-"
         up = fmt_uptime(process.get("started_at")) if process["status"] == "running" else "-"
+        tty = 'yes' if p.get('tty', True) else 'no'
         print(
             f"{process['name']:<{namew}}  {process['status']:<{statw}}  "
-            f"{str(pid):>7}  {up:>8}  {process['cmd']}"
+            f"{str(pid):>7}  {up:>8}  {tty:<3}  {process['cmd']}"
         )
     return 0
 
@@ -777,6 +825,7 @@ def cmd_up(state_dir, args):
     resp = send_request(state_dir, {
         "cmd": "up",
         "processes": args.processes or None,
+        "tty": not args.no_tty
     })
     if not resp or "error" in (resp or {}):
         print((resp or {}).get("error", "no response"), file=sys.stderr)
@@ -804,7 +853,9 @@ def cmd_stop(state_dir, args):
 
 
 def cmd_start(state_dir, args):
-    resp = send_request(state_dir, {"cmd": "start", "process": args.process})
+    resp = send_request(state_dir, {"cmd": "start",
+                                    "process": args.process,
+                                    "tty": not args.no_tty})
     if not resp or "error" in resp:
         print((resp or {}).get("error", "no response"), file=sys.stderr)
         return 1
@@ -1019,6 +1070,9 @@ def build_parser():
 
     up = sub.add_parser("up", help="start processes and follow logs (unless -d)")
     up.add_argument("-d", "--detach", action="store_true", help="start in background and return")
+    up.add_argument("-T", '--no-TTY', dest='no_tty', action='store_true',
+                    help='disable pseudo-tty allocation (plain pipes; '
+                         "'attach' will be unavailable for these processes)") 
     up.add_argument("processes", nargs="*", help="names to start (default: all in Procfile)")
 
     stop = sub.add_parser("stop", help="stop a running process")
@@ -1026,6 +1080,8 @@ def build_parser():
 
     start = sub.add_parser("start", help="(re-)start a process")
     start.add_argument("process")
+    start.add_argument('-T', '--no-TTY', dest='no_tty', action='store_true',
+                       help='disable pseudo-tty allocation')
 
     log = sub.add_parser("log", help="show logs")
     log.add_argument("-f", "--follow", action="store_true")
