@@ -40,19 +40,7 @@ CLI usage mirrors Docker Compose; think of Procman as a Docker Compose that runs
 
 ## Installation
 
-Recommended:
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/luke10x/procman/main/install.py)"
-```
-
-Alternatively, clone and run `python3 install.py`:
-
-```bash
-git clone https://github.com/luke10x/procman && cd procman && python3 install.py
-```
-
-Then add the install location to your PATH (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
+All you need is [`./proc`](https://raw.githubusercontent.com/luke10x/procman/main/proc) — just copy it into a directory on your PATH and you're set.
 
 ## Requirements
 
