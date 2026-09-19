@@ -1,5 +1,7 @@
 # Procman
 
+Note: there is already a repo at https://github.com/sarnold/procman/ — our Procman is a completely different project with no affiliation. If we need to rename ours, we can; but for now this name works. If you don't like it, don't use it.
+
 Procman is a lightweight Procfile process manager for running, logging, and controlling local development services through a detachable daemon.
 
 ## Features
@@ -10,6 +12,9 @@ Procman is a lightweight Procfile process manager for running, logging, and cont
 - Starts, stops, and lists individual processes
 - Supports PTY attach for interactive processes
 - Stores daemon state and logs under `~/.procman`
+
+- Single-file Python program — no external dependencies, just the standard library
+- Zero installation overhead — copy `proc` into your project and run it
 
 ### How Procman differs from Foreman / Honcho
 
