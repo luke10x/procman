@@ -1,0 +1,2 @@
+web: exec python3 -m http.server --bind 127.0.0.1 ${PORT}
+ticker: exec bash -c 'while true; do date +tick-%s; sleep 0.2; done'

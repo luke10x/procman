@@ -4,19 +4,9 @@ Note: there is already a repo at https://github.com/sarnold/procman/ — our Pro
 
 ## Installation
 
-Recommended:
+Procman is a single self-contained Python program with no external dependencies. All you need is the `proc` file from this repo: copy it into your project or anywhere on your `PATH`, make it executable, and run it how you like.
 
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/luke10x/procman/main/install.sh)"
-```
-
-Alternatively, clone and run `./install.sh`:
-
-```bash
-git clone https://github.com/luke10x/procman && cd procman && ./install.sh
-```
-
-Then add the install location to your PATH (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
+If you prefer a helper, `install.py` can copy `proc` into a writable directory on your `PATH`.
 
 Procman is a lightweight Procfile process manager for running, logging, and controlling local development services through a detachable daemon.
 
@@ -27,6 +17,7 @@ Procman is a lightweight Procfile process manager for running, logging, and cont
 - Streams combined logs with process-name prefixes
 - Starts, stops, and lists individual processes
 - Supports PTY attach for interactive processes
+- Supports `-T` / `--no-TTY` for plain-pipe processes with non-interactive logs
 - Stores daemon state and logs under `~/.procman`
 
 - Single-file Python program — no external dependencies, just the standard library
@@ -37,10 +28,6 @@ Procman is a lightweight Procfile process manager for running, logging, and cont
 Procman is a PTY-aware process supervisor for Procfiles: like [Foreman](https://github.com/ddollar/foreman) / [Honcho](https://github.com/DHH/honcho) in CLI usage, but it allocates pseudo-terminals per process (so you can detach them with Ctrl‑P/Ctrl‑Q), runs them as a daemon, and includes a no-TTY mode that behaves like the plain Foreman/Honcho.
 
 CLI usage mirrors Docker Compose; think of Procman as a Docker Compose that runs processes instead of containers.
-
-## Installation
-
-All you need is [`./proc`](https://raw.githubusercontent.com/luke10x/procman/main/proc) — just copy it into a directory on your PATH and you're set.
 
 ## Requirements
 
@@ -89,10 +76,11 @@ Stop everything:
 ## Commands
 
 ```sh
-./proc up [-d] [PROC ...]
+./proc up [-d] [-T] [PROC ...]
 ```
 
 Starts all processes from the `Procfile`, or only the named processes. Without `-d`, Procman attaches to logs after startup.
+Pass `-T` / `--no-TTY` to run processes without pseudo-terminals. This uses plain pipes with stdin closed, so `attach` is unavailable for those processes.
 
 ```sh
 ./proc ps
@@ -108,11 +96,12 @@ Shows each managed process, status, PID, uptime, and command.
 Prints recent logs for all or selected processes. Use `-f` to follow new log output.
 
 ```sh
-./proc start PROC
+./proc start [-T] PROC
 ./proc stop PROC
 ```
 
 Starts or stops a single process by name.
+Pass `-T` / `--no-TTY` to start the process without a pseudo-terminal.
 
 ```sh
 ./proc attach PROC
@@ -143,3 +132,11 @@ Procman stores state in:
 ```
 
 Each project gets a separate state directory based on the absolute Procfile path. Process logs are written inside that directory under `logs/`.
+
+## Tests
+
+Run the black-box test suite with:
+
+```sh
+python3 -m unittest ./tests/test_proc_blackbox.py
+```

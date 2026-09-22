@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Local Procman scratch files/state.
+/Procfile
+/.procman/
+/.tmp-procman-*/

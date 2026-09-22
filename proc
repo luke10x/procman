@@ -166,12 +166,12 @@ class ManagedProcess:
                 master_fd, slave_fd = pty.openpty()
                 self._master_fd = master_fd
                 set_winsize(master_fd, 24, 80)
-                env.setdefault('TERM', 'xterm-256color')
-                stdin_t = stdout_t = stderr = slave_fd
+                env.setdefault("TERM", "xterm-256color")
+                stdin_t = stdout_t = stderr_t = slave_fd
             else:
                 # -T / --no-TTY: plain pipes, no PTY
                 self._master_fd = None
-                slave_fd
+                slave_fd = None
                 stdin_t = subprocess.DEVNULL
                 stdout_t = subprocess.PIPE
                 stderr_t = subprocess.STDOUT
@@ -192,8 +192,6 @@ class ManagedProcess:
                     env=env,
                 )
             finally:
-                # try: os.close(slave_fd)
-                # except Exception: pass
                 if slave_fd is not None:
                     try: os.close(slave_fd)
                     except Exception: pass
@@ -815,7 +813,7 @@ def cmd_ps(state_dir, args):
     for process in procs:
         pid = process.get("pid") or "-"
         up = fmt_uptime(process.get("started_at")) if process["status"] == "running" else "-"
-        tty = 'yes' if p.get('tty', True) else 'no'
+        tty = "yes" if process.get("tty", True) else "no"
         print(
             f"{process['name']:<{namew}}  {process['status']:<{statw}}  "
             f"{str(pid):>7}  {up:>8}  {tty:<3}  {process['cmd']}"
